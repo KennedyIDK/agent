@@ -43,7 +43,7 @@ I recommend setting these in your shell profile (e.g. `~/.bashrc`), just remembe
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
 
 ## Acknowledgments
 
