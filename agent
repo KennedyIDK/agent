@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+
+# agent
+#
+# A simple wrapper around the age encryption tool that supports both key-based
+# and password-based encryption/decryption.
+#
+# Can be run interactively from a terminal or non-interactively from file 
+# manager custom actions.
+#
+# Usage: agent [-d] [-p] [-r] <input_files>
+#
+# Options:
+#   -d   Decrypt mode (default is encrypt)
+#   -p   Use password-based encryption (default is key-based)
+#   -r   Remove original file after successful encryption
+#   -q   Quiet mode (no output to terminal)
+#   -h   Show help message
+
+_SCRIPT_NAME="$(basename "$0")"
+readonly _SCRIPT_NAME
+_SCRIPT_DIR="$(dirname "$0")"
+readonly _SCRIPT_DIR
+
+# Bash Settings
+# =============================================================================
+
+set -o errexit  # abort on nonzero exitstatus
+set -o nounset  # abort on unbound variable
+set -o pipefail # don't hide errors within pipes
+
+trap 'cleanup' EXIT ERR INT TERM
+
+if [ -t 0 ] && [ -t 1 ] && tty -s; then
+  readonly _INTERACTIVE=true
+else
+  readonly _INTERACTIVE=false
+fi
+
+# Debugging
+# =============================================================================
+
+readonly _DEBUG=false
+
+readonly _LOG_DIR="${SCRIPT_LOGS:-${_SCRIPT_DIR}/.logs}"
+readonly _LOG_FILE="${_LOG_DIR}/${_SCRIPT_NAME}.log"
+
+mkdir -p "${_LOG_DIR}" && touch "${_LOG_FILE}"
+
+# Global Variables
+# =============================================================================
+
+# Source shell configuration if age keys are not available
+# This is needed for non-interactive mode with GUI applications
+if [[ -z "${AGE_PUBKEY:-}" ]] || [[ -z "${AGE_SECKEY:-}" ]]; then
+  if [[ -f "${HOME}/.bashrc" ]]; then
+    # shellcheck source=/dev/null
+    source <(grep -E '^export (AGE_PUBKEY|AGE_SECKEY)=' "${HOME}/.bashrc")
+  fi
+fi
+
+readonly _AGE_PUBLIC_KEY="${AGE_PUBKEY:-}"
+readonly _AGE_PRIVATE_KEY="${AGE_SECKEY:-}"
+
+_PASSWORD_MODE=false   # default is key-based
+_DECRYPT_MODE=false    # default is encrypt
+_REMOVE_ORIGINAL=false # default is to prompt user
+_QUIET_MODE=false      # default is to prompt user
+
+_INPUT_FILES=()
+declare -A _OUTPUT_FILE
+
+# Main
+# =============================================================================
+
+main() {
+  check_dependencies
+  validate_age_keys
+
+  parse_arguments "$@"
+
+  validate_input_files
+  determine_output_files
+
+  for input_file in "${_INPUT_FILES[@]}"; do
+    deb "Processing file: ${input_file}"
+    validate_output_file_for "$input_file"
+    check_disk_space_for "$input_file"
+    process_file "$input_file"
+    remove_original_file "$input_file"
+  done
+}
+
+# Functions
+# =============================================================================
+
+check_dependencies() {
+  local missing_dependencies=()
+  local dependencies=(
+    "age"
+  )
+
+  for cmd in "${dependencies[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_dependencies+=("$cmd")
+    fi
+  done
+
+  if [[ "${#missing_dependencies[@]}" -gt 0 ]]; then
+    err "Missing dependencies: ${missing_dependencies[*]}"
+    exit 1
+  fi
+}
+
+parse_arguments() {
+  while getopts "dpqrh" opt; do
+    case "$opt" in
+    d) _DECRYPT_MODE=true ;;
+    p) _PASSWORD_MODE=true ;;
+    q) _QUIET_MODE=true ;;
+    r) _REMOVE_ORIGINAL=true ;;
+    h)
+      usage
+      exit 0
+      ;;
+    *)
+      err "Unknown option: $opt"
+      usage
+      exit 1
+      ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  _INPUT_FILES=("${@}")
+}
+
+validate_age_keys() {
+  if [[ "${_PASSWORD_MODE}" = false ]]; then
+    if [[ "${_DECRYPT_MODE}" = true && -z "${_AGE_PRIVATE_KEY}" ]]; then
+      err "AGE_SECKEY environment variable is not set"
+      key_setup_help
+      exit 1
+    elif [[ "${_DECRYPT_MODE}" = false && -z "${_AGE_PUBLIC_KEY}" ]]; then
+      err "AGE_PUBKEY environment variable is not set"
+      key_setup_help
+      exit 1
+    fi
+  fi
+}
+
+validate_file_path_for() {
+  # Used in validate_input_files(), validate_output_file_for()
+  local file_path="$1"
+  local operation="$2"
+  local max_path_length=4096
+
+  if [[ "$file_path" =~ ^/ ]]; then
+    err "Absolute paths not allowed: $file_path"
+    exit 1
+  fi
+
+  if [[ "$file_path" =~ \.\. ]]; then
+    err "Path traversal not allowed: $file_path"
+    exit 1
+  fi
+
+  if [[ "${#file_path}" -gt "${max_path_length}" ]]; then
+    err "File path too long: $file_path"
+    exit 1
+  fi
+
+  if [[ "$file_path" =~ [\<\>\:\"\|\\\?\*] ]]; then
+    err "File path contains invalid characters: $file_path"
+    exit 1
+  fi
+
+  if [[ "$operation" = "input" && ! -f "$file_path" ]]; then
+    err "Input file does not exist: $file_path"
+    exit 1
+  fi
+
+  if [[ "$operation" = "input" && ! -r "$file_path" ]]; then
+    err "Input file not readable: $file_path"
+    exit 1
+  fi
+
+  if [[ "$operation" = "output" ]]; then
+    local output_dir
+    output_dir="$(dirname "$file_path")"
+    if [[ ! -w "$output_dir" ]]; then
+      err "Output directory not writable: $output_dir"
+      exit 1
+    fi
+  fi
+}
+
+validate_input_files() {
+  local -A seen_files
+  for input_file in "${_INPUT_FILES[@]}"; do
+    if [[ -n "${seen_files[$input_file]:-}" ]]; then
+      err "Duplicate input file: $input_file"
+      exit 1
+    fi
+    seen_files["$input_file"]=1
+
+    if ! validate_file_path_for "$input_file" "input"; then
+      exit 1
+    fi
+
+    if [[ "${_DECRYPT_MODE}" = true && "${input_file}" != *.age ]]; then
+      err "File '${input_file}' does not have .age extension"
+      exit 1
+    fi
+
+    if [[ "${_DECRYPT_MODE}" = false && "${input_file}" == *.age ]]; then
+      err "File '${input_file}' already has .age extension"
+      exit 1
+    fi
+  done
+}
+
+determine_output_files() {
+  for input_file in "${_INPUT_FILES[@]}"; do
+    if [[ "${_DECRYPT_MODE}" = true ]]; then
+      _OUTPUT_FILE["$input_file"]="${input_file%.age}.decrypted"
+    else
+      _OUTPUT_FILE["$input_file"]="${input_file}.age"
+    fi
+  done
+}
+
+validate_output_file_for() {
+  local input_file="$1"
+  local output_file="${_OUTPUT_FILE[$input_file]}"
+
+  if ! validate_file_path_for "${output_file}" "output"; then
+    exit 1
+  fi
+
+  if [[ -f "${output_file}" ]]; then
+    if [[ "${_INTERACTIVE}" = true ]] && [[ "${_QUIET_MODE}" = false ]]; then
+      local overwrite
+      read -r -p "File '${output_file}' already exists. Overwrite? (y/n): " overwrite
+      if [[ "${overwrite}" != "y" ]]; then
+        err "No overwrite permission given"
+        exit 1
+      fi
+    else
+      err "File '${output_file}' already exists"
+      exit 1
+    fi
+  fi
+}
+
+check_disk_space_for() {
+  local min_disk_space_multiplier=2
+  local input_file="$1"
+  local output_file="${_OUTPUT_FILE[$input_file]}"
+  local output_dir
+  output_dir="$(dirname "${output_file}")"
+
+  local input_size
+  input_size="$(stat -c%s "${input_file}" 2>/dev/null || stat -f%z "${input_file}" 2>/dev/null || echo "0")"
+
+  local available_space
+  available_space="$(df -B1 "${output_dir}" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")"
+
+  local required_space=$((input_size * min_disk_space_multiplier))
+
+  if [[ "${required_space}" -gt "${available_space}" ]]; then
+    err "Insufficient disk space for output file: ${output_file}."
+    exit 1
+  fi
+}
+
+process_file() {
+  local input_file="$1"
+  local output_file="${_OUTPUT_FILE[$input_file]}"
+
+  # Decryption
+  if [[ "${_DECRYPT_MODE}" = true ]]; then
+    if [[ "${_PASSWORD_MODE}" = true ]]; then
+      if ! age --decrypt --output "${output_file}" "${input_file}"; then
+        err "Password-based decryption of '${input_file}' failed"
+        exit 1
+      fi
+    else
+      if ! age --decrypt --identity "${_AGE_PRIVATE_KEY}" --output "${output_file}" "${input_file}"; then
+        err "Key-based decryption of '${input_file}' failed"
+        exit 1
+      fi
+    fi
+  # Encryption
+  else
+    if [[ "${_PASSWORD_MODE}" = true ]]; then
+      if ! age --passphrase --output "${output_file}" "${input_file}"; then
+        err "Password-based encryption of '${input_file}' failed"
+        exit 1
+      fi
+    else
+      if ! age --output "${output_file}" --recipient "${_AGE_PUBLIC_KEY}" "${input_file}"; then
+        err "Key-based encryption of '${input_file}' failed"
+        exit 1
+      fi
+    fi
+  fi
+
+  if [[ "${_QUIET_MODE}" = false ]]; then
+    echo "Processed file: ${input_file} -> ${output_file}"
+  fi
+}
+
+remove_original_file() {
+  local input_file="$1"
+
+  if [[ "${_REMOVE_ORIGINAL}" = true ]]; then
+    rm "${input_file}"
+  elif [[ "${_INTERACTIVE}" = true ]] && [[ "${_QUIET_MODE}" = false ]]; then
+    local response
+    read -r -p "Remove original file '${input_file}'? (y/n): " response
+    if [[ "${response}" = "y" ]]; then
+      rm "${input_file}"
+    else
+      echo "Response is not 'y', original file not removed."
+    fi
+  fi
+}
+
+# Cleanup Functions
+# =====================================
+
+cleanup() {
+  local exit_code=$?
+
+  if [[ $exit_code -eq 0 ]]; then
+    deb "Script completed successfully"
+  else
+    err "Script failed with exit code: $exit_code"
+    if [[ "${_INTERACTIVE}" = false ]]; then
+      notify-send "${_SCRIPT_NAME} failed with exit code: $exit_code. See ${_LOG_FILE} for more details."
+    fi
+  fi
+
+  exit "$exit_code"
+}
+
+# Error Handling Functions
+# =====================================
+
+err() {
+  local timestamp
+  timestamp="$(date +'%Y-%m-%dT%H:%M:%S%z')"
+  local message="ERROR/${_SCRIPT_NAME} ${timestamp}: $*"
+
+  printf "%s\n" "${message}" | tee -a "${_LOG_FILE}" >&2
+}
+
+deb() {
+  if [[ "${_DEBUG}" = true ]]; then
+    local timestamp
+    timestamp="$(date +'%Y-%m-%dT%H:%M:%S%z')"
+    local message="DEBUG/${_SCRIPT_NAME} ${timestamp}: $*"
+
+    printf "%s\n" "${message}" | tee -a "${_LOG_FILE}" >&2
+  fi
+}
+
+# Usage Functions
+# =====================================
+
+usage() {
+  cat <<USAGE
+Usage: ${_SCRIPT_NAME} [OPTIONS] <input_files>
+
+A wrapper around the age encryption tool that supports both key-based
+and password-based encryption/decryption.
+
+Options:
+   -d   Decrypt mode (default is encrypt)
+   -p   Use password-based encryption (default is key-based)
+   -r   Remove original file after successful encryption
+   -q   Quiet mode (no output to terminal)
+   -h   Show help message
+
+Examples:
+    ${_SCRIPT_NAME} file.txt
+    ${_SCRIPT_NAME} file.txt file2.txt
+    ${_SCRIPT_NAME} -pr file.txt
+    ${_SCRIPT_NAME} -d file.txt.age
+USAGE
+}
+
+key_setup_help() {
+  if [[ "${_INTERACTIVE}" = true ]]; then
+    cat >&2 <<KEY_SETUP_HELP
+To use key-based encryption, set up your age keys:
+
+1. Generate a key pair:
+   age-keygen -o ~/.age/key.txt
+
+   This will create a key pair in ~/.age/key.txt.
+
+2. Encrypt the key pair with a password: (optional)
+   age -e -p -o ~/.age/key.txt.age ~/.age/key.txt 
+
+   This will encrypt the key pair with a password and save it to ~/.age/key.txt.age.
+
+3. Set environment variables in your shell configuration:
+   export AGE_SECKEY=~/.age/key.txt(.age)
+   export AGE_PUBKEY=age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+For more information, see: https://github.com/FiloSottile/age
+KEY_SETUP_HELP
+  fi
+}
+
+# =============================================================================
+
+main "$@"
